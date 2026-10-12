@@ -52,6 +52,22 @@ export SERVER_SSL_KEY_ALIAS=water-box
 ./mvnw spring-boot:run
 ```
 
+## 模拟埋点
+
+启动服务后，使用标准库脚本发送 10 条测试事件：
+
+```bash
+python3 tools/simulate_traffic.py
+```
+
+可指定事件数量和并发数：
+
+```bash
+python3 tools/simulate_traffic.py --count 100 --concurrency 10
+```
+
+脚本在服务返回 `202` 时视为 Kafka 已确认写入；若返回非 `202` 或无法连接服务，会输出失败详情并以非零状态码退出。
+
 ## 吞吐配置
 
 Kafka 生产端已启用幂等写入、`acks=all`、LZ4 压缩、64 KiB 批次、5 ms 批量等待和 128 MiB 缓冲区。Tomcat 配置为 400 个请求线程、10,000 个请求队列和 20,000 个连接。
