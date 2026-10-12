@@ -8,3 +8,5 @@ target/
 *.p12
 *.jks
 .env
+__pycache__/
+*.pyc
