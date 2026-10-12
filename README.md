@@ -54,19 +54,20 @@ export SERVER_SSL_KEY_ALIAS=water-box
 
 ## 模拟埋点
 
-启动服务后，使用标准库脚本发送 10 条测试事件：
+启动服务后，使用标准库脚本持续发送测试事件，默认每 5 秒一条。使用 `Ctrl+C` 停止：
 
 ```bash
 python3 tools/simulate_traffic.py
 ```
 
-可指定事件数量和并发数：
+可修改发送间隔，或通过 `--count` 指定发送次数：
 
 ```bash
-python3 tools/simulate_traffic.py --count 100 --concurrency 10
+python3 tools/simulate_traffic.py --interval 1
+python3 tools/simulate_traffic.py --count 10
 ```
 
-脚本在服务返回 `202` 时视为 Kafka 已确认写入；若返回非 `202` 或无法连接服务，会输出失败详情并以非零状态码退出。
+脚本在服务返回 `202` 时视为 Kafka 已确认写入；若返回非 `202` 或无法连接服务，会输出失败详情。服务端会为每个收到的事件输出一条 `INFO` 日志，但不会记录完整 payload。
 
 ## 吞吐配置
 
