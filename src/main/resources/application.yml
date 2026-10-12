@@ -1,0 +1,54 @@
+spring:
+  application:
+    name: water-box
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:10.37.215.3:9092}
+    producer:
+      acks: all
+      retries: 2147483647
+      properties:
+        enable.idempotence: true
+        compression.type: lz4
+        linger.ms: 5
+        batch.size: 65536
+        buffer.memory: 134217728
+        max.in.flight.requests.per.connection: 5
+        delivery.timeout.ms: 120000
+        request.timeout.ms: 30000
+        max.block.ms: 5000
+  mvc:
+    async:
+      request-timeout: 30000
+  threads:
+    virtual:
+      enabled: false
+
+server:
+  port: ${SERVER_PORT:8443}
+  tomcat:
+    threads:
+      max: 400
+      min-spare: 50
+    accept-count: 10000
+    max-connections: 20000
+    connection-timeout: 5000ms
+  ssl:
+    enabled: ${SERVER_SSL_ENABLED:false}
+    key-store: ${SERVER_SSL_KEY_STORE:}
+    key-store-type: ${SERVER_SSL_KEY_STORE_TYPE:PKCS12}
+    key-store-password: ${SERVER_SSL_KEY_STORE_PASSWORD:}
+    key-alias: ${SERVER_SSL_KEY_ALIAS:}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+
+water-box:
+  kafka:
+    topic: ${KAFKA_TOPIC:community.events.v1}
