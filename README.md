@@ -1,11 +1,11 @@
 # water-box
 
-`water-box` 接收社区应用通过 HTTPS 上报的埋点事件，并可靠地写入 Kafka。
+`water-box` 接收社区应用上报的埋点事件，并可靠地写入 Kafka。当前默认使用 HTTP，后续可通过配置开启 HTTPS。
 
 ## 服务约定
 
 - 接口：`POST /api/v1/events`
-- 默认监听端口：`8443`
+- 默认监听端口：`8080`
 - Kafka Broker：`10.37.215.3:9092`
 - Kafka Topic：`community.events.v1`
 - 成功响应：Kafka 确认写入后返回 `202 Accepted`
@@ -14,7 +14,7 @@
 请求示例：
 
 ```bash
-curl --request POST https://localhost:8443/api/v1/events \
+curl --request POST http://localhost:8080/api/v1/events \
   --header 'Content-Type: application/json' \
   --data '{
     "eventType": "design.viewed",
@@ -36,13 +36,13 @@ curl --request POST https://localhost:8443/api/v1/events \
 ./mvnw test
 ```
 
-本地开发时可不开启 TLS：
+临时 HTTP 启动：
 
 ```bash
 ./mvnw spring-boot:run
 ```
 
-对外提供服务前，请配置 PKCS#12 格式证书：
+临时 HTTP 仅应在可信内网使用。后续需要 HTTPS 时，配置 PKCS#12 格式证书：
 
 ```bash
 export SERVER_SSL_ENABLED=true
