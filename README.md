@@ -135,6 +135,12 @@ python3 tools/simulate_traffic.py --dry-run --count 100 --interval 0
 脚本仅模拟埋点，不调用真实社区业务 API。内存状态在脚本退出后重置，各次运行 ID 不重叠。
 脚本在服务返回 `202` 时视为 Kafka 已确认写入；失败消息沿用原 `log_id` 优先重试，重试也计入限速和 `--count`。并发发送时，关联事件的接收顺序可能与生成顺序不同；消费端应使用时间戳与链路字段关联。
 服务端为每个收到的合法事件输出一条 `INFO` 日志，Kafka 异步发送失败输出 `ERROR`，不会记录完整 `properties`。
+埋点日志只写入 `logs/events.log`，避免高频控制台输出阻塞 HTTP 请求线程；每天或每 100MB 滚动，保留 7 天，总量上限 1GB。
+可通过 `--water-box.logging.path=/指定目录` 修改日志目录。
+
+```bash
+tail -f logs/events.log
+```
 
 ## 吞吐配置
 
