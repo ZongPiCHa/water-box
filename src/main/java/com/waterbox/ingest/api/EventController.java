@@ -30,15 +30,17 @@ public class EventController {
             @Valid @RequestBody EventIngestRequest request
     ) {
         log.info(
-                "Event received: type={}, designId={}, communityId={}, userId={}",
-                request.eventType(),
-                request.designId(),
-                request.communityId(),
+                "Event received: log_id={}, system={}, theme={}, action={}, user_id={}",
+                request.logId(),
+                request.system(),
+                request.theme(),
+                request.action(),
                 request.userId()
         );
         return eventPublisher.publish(request)
                 .handle((response, exception) -> {
                     if (exception != null) {
+                        log.error("Kafka publish failed: log_id={}", request.logId(), exception);
                         return ResponseEntity.<EventAcceptedResponse>status(HttpStatus.SERVICE_UNAVAILABLE).build();
                     }
                     return ResponseEntity.status(HttpStatus.ACCEPTED).body(response);

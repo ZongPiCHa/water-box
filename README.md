@@ -17,16 +17,56 @@
 curl --request POST http://localhost:8080/api/v1/events \
   --header 'Content-Type: application/json' \
   --data '{
-    "eventType": "design.viewed",
-    "occurredAt": "2026-10-12T10:15:30Z",
-    "userId": "user-123",
-    "communityId": "community-42",
-    "designId": "design-9001",
-    "payload": {"referrer": "home"}
+    "timestamp": 1791849600000,
+    "log_id": "log-001",
+    "session_id": "session-001",
+    "span_id": "span-002",
+    "pre_span_id": "span-001",
+    "system": "backend",
+    "theme": "community",
+    "action": "like",
+    "user_id": "user-123",
+    "team_id": null,
+    "username": "designer",
+    "env": "test",
+    "properties": {
+      "project_id": "project-9001",
+      "author_user_id": "user-456",
+      "location": "america",
+      "duration": 1200
+    }
   }'
 ```
 
-`eventType`、`occurredAt` 和 `payload` 为必填字段。Kafka 分区键依次优先选择 `designId`、`communityId`、`userId`，以保证同一实体的事件顺序。
+## 埋点协议
+
+| 字段 | 约定 |
+| --- | --- |
+| `timestamp` | 必填，正整数 Unix 毫秒时间戳，表示动作发生时间 |
+| `log_id` | 必填，发送方生成的一次埋点唯一 ID，重试沿用同一个值 |
+| `session_id` | 必填，用户会话 ID，同一会话中的多次动作共用 |
+| `span_id` | 必填，本次操作链路 ID |
+| `pre_span_id` | 上游链路 ID，根链路为空 |
+| `system` | 必填，`front`（前端）或 `backend`（后端） |
+| `theme` | 必填，业务主题，例如 `login_page`、`community` |
+| `action` | 必填，最小动作，例如 `login`、`register`、`like` |
+| `user_id` | 用户稳定 ID，匿名访问可为空 |
+| `team_id` | 操作所属团队 ID，个人操作可为空；以团队发布作品时填写 |
+| `username` | 动作发生时的用户名，可变化，不能作为用户唯一标识 |
+| `env` | 必填，`prod` 或 `test` |
+| `properties` | 必填 JSON 对象，可为 `{}`，支持字符串、数值、布尔、数组、嵌套对象 |
+
+通用字符串最长 128 字符。Kafka 消息使用以上 snake_case 字段，保留发送方的 `log_id`、时间戳与自定义属性，不额外生成事件 ID。
+分区键优先使用 `properties.project_id`，其次为 `user_id`，匿名事件使用 `log_id`。同一分区内按 Kafka 实际接收顺序排列，多发送方并发上报时不保证业务时间顺序。
+
+成功响应示例：
+
+```json
+{"log_id":"log-001","accepted_at":"2026-10-13T00:00:00Z"}
+```
+
+这是对旧版 `eventType/occurredAt/payload` 协议的替换，发送方需要同步升级。
+接收服务不验证作品、评论等业务是否真实存在，也不按 `log_id` 去重；客户端超时不代表消息一定未写入，重试可能产生相同 `log_id` 的多条记录，消费端应据此去重。
 
 ## 本地开发
 
@@ -46,6 +86,7 @@ curl --request POST http://localhost:8080/api/v1/events \
 
 ```bash
 export SERVER_SSL_ENABLED=true
+export SERVER_PORT=8443
 export SERVER_SSL_KEY_STORE=/absolute/path/water-box.p12
 export SERVER_SSL_KEY_STORE_PASSWORD=changeit
 export SERVER_SSL_KEY_ALIAS=water-box
@@ -54,7 +95,7 @@ export SERVER_SSL_KEY_ALIAS=water-box
 
 ## 模拟埋点
 
-启动服务后，使用标准库脚本持续发送测试事件，默认每 5 秒一条。使用 `Ctrl+C` 停止：
+启动升级后的服务后，使用 Python 3 标准库脚本模拟 100 个用户，持续发送测试事件，默认每条响应后等待 5 秒。使用 `Ctrl+C` 停止：
 
 ```bash
 python3 tools/simulate_traffic.py
@@ -64,10 +105,34 @@ python3 tools/simulate_traffic.py
 
 ```bash
 python3 tools/simulate_traffic.py --interval 1
-python3 tools/simulate_traffic.py --count 10
+python3 tools/simulate_traffic.py --count 1000 --interval 0.1 --seed 42
+python3 tools/simulate_traffic.py --endpoint http://服务器IP:8080/api/v1/events
+python3 tools/simulate_traffic.py --dry-run --count 100 --interval 0
 ```
 
-脚本在服务返回 `202` 时视为 Kafka 已确认写入；若返回非 `202` 或无法连接服务，会输出失败详情。服务端会为每个收到的事件输出一条 `INFO` 日志，但不会记录完整 payload。
+`--users` 默认 100，`--env` 默认 `test`，可设为 `prod`；`--count` 为请求尝试次数，0 表示持续运行。
+`--dry-run` 仅将 JSON 输出到标准输出，不发送请求；启动信息和汇总输出到标准错误。随机种子固定行为序列，ID 和真实时间戳仍随运行变化。
+
+| 主题/动作 | 上报端 | 模拟行为 |
+| --- | --- | --- |
+| `community/view` | `front` | 浏览作品，包含停留时长、来源页面 |
+| `community/like`、`community/unlike` | `backend` | 点赞；约 10% 的点赞延迟取消 |
+| `community/comment`、`community/delete_comment` | `backend` | 评论；约 10% 的评论由原作者延迟删除 |
+| `community/share` | `front` | 前端生成转发链接，不生成后端转发事件 |
+| `community/follow` | `backend` | 关注作品作者，同一用户不重复关注同一作者 |
+| `community/publish` | `backend` | 发布个人或团队作品，团队作品带顶层 `team_id` |
+| `login_page/view`、`login_page/login` | `front`、`backend` | 少量登录页浏览及登录成功事件 |
+| `profile/update_username`、`team/join` | `backend` | 少量改名、加入团队，`user_id` 保持不变 |
+
+模拟器初始化约 50 个历史作品，不发送它们的发布事件；新作品会先产生发布事件再参与互动。
+作品使用 `project_id`，评论使用 `comment_id`，关注目标使用 `target_user_id`，这些业务字段都放在 `properties`。
+作品热度和用户活跃度有差异，同一用户不能重复点赞同一作品，也不能关注自己。
+互动先生成关联浏览，通过 `pre_span_id` 连接上游 `span_id`；用户登录或闲置 30 分钟后更换会话。
+取消和删除会延迟 5～30 个生成步骤，因此短样本或运行末尾尚未执行的操作会让实际比例偏离 10%。不生成删除作品事件。
+
+脚本仅模拟埋点，不调用真实社区业务 API。内存状态在脚本退出后重置，各次运行 ID 不重叠。
+脚本在服务返回 `202` 时视为 Kafka 已确认写入；失败后保留同一条消息并继续重试，防止跳过关联动作。
+服务端为每个收到的合法事件输出一条 `INFO` 日志，Kafka 异步发送失败输出 `ERROR`，不会记录完整 `properties`。
 
 ## 吞吐配置
 
