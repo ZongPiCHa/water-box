@@ -3,6 +3,7 @@
 
 import argparse
 from collections import Counter, deque
+from concurrent.futures import ThreadPoolExecutor
 import heapq
 import json
 import random
@@ -204,14 +205,19 @@ def parse_arguments():
     parser.add_argument("--endpoint", default="http://127.0.0.1:8080/api/v1/events")
     parser.add_argument("--users", type=int, default=100)
     parser.add_argument("--count", type=int, default=0, help="发送条数，0 表示持续运行")
-    parser.add_argument("--interval", type=float, default=5, help="每条响应后的等待秒数")
+    rate = parser.add_mutually_exclusive_group()
+    rate.add_argument("--qps", type=float, default=100, help="每秒请求尝试次数，默认 100")
+    rate.add_argument("--interval", type=float, help="请求发起间隔秒数，0 表示不限速")
+    parser.add_argument("--concurrency", type=int, default=100, help="最大并发请求数")
     parser.add_argument("--timeout", type=float, default=35)
     parser.add_argument("--env", choices=["prod", "test"], default="test")
     parser.add_argument("--seed", type=int, help="固定行为随机种子")
     parser.add_argument("--dry-run", action="store_true", help="仅打印 JSON，不调用服务")
     args = parser.parse_args()
-    if args.users < 2 or args.count < 0 or args.interval < 0 or args.timeout <= 0:
-        parser.error("users 至少为 2，count 和 interval 非负，timeout 为正")
+    if (args.users < 2 or args.count < 0 or args.qps <= 0
+            or (args.interval is not None and args.interval < 0)
+            or args.timeout <= 0 or args.concurrency < 1):
+        parser.error("users 至少为 2，count 和 interval 非负，qps、timeout 和 concurrency 为正")
     return args
 
 
@@ -234,34 +240,66 @@ def main():
     simulator = CommunitySimulator(args.users, args.env, args.seed)
     successes = failures = attempts = 0
     actions = Counter()
-    event = None
-    print(f"模拟 {args.users} 用户，env={args.env}，间隔={args.interval:g}s，Ctrl+C 停止。",
+    interval = args.interval if args.interval is not None else 1 / args.qps
+    pending = {}
+    retries = deque()
+    started = next_send = last_report = time.monotonic()
+    reported_attempts = 0
+    print(f"模拟 {args.users} 用户，env={args.env}，"
+          f"发送间隔={interval:g}s，并发上限={args.concurrency}，Ctrl+C 停止。",
           file=sys.stderr, flush=True)
-    try:
-        while args.count == 0 or attempts < args.count:
-            # 失败后重试同一条，保持 log_id 和业务关联，不跳过前置操作。
-            if event is None:
-                event = simulator.next_event()
-            attempts += 1
-            if args.dry_run:
-                print(json.dumps(event, ensure_ascii=False), flush=True)
-                status = 202
-            else:
-                status, body = send_event(args.endpoint, event, args.timeout)
-                print(f"[{attempts}] {event['system']}/{event['theme']}/{event['action']} "
-                      f"user={event['user_id']} log_id={event['log_id']} "
-                      f"status={status} response={body}", flush=True)
+
+    def collect_results():
+        nonlocal successes, failures
+        for future in list(pending):
+            if not future.done():
+                continue
+            event = pending.pop(future)
+            status, body = future.result()
             if status == 202:
                 successes += 1
                 actions[event["action"]] += 1
-                event = None
             else:
                 failures += 1
-            if args.count == 0 or attempts < args.count:
-                time.sleep(args.interval)
+                retries.append(event)
+                print(f"失败：log_id={event['log_id']} status={status} response={body}",
+                      file=sys.stderr, flush=True)
+
+    executor = ThreadPoolExecutor(max_workers=args.concurrency)
+    try:
+        while args.count == 0 or attempts < args.count:
+            collect_results()
+            now = time.monotonic()
+            if now - last_report >= 1:
+                print(f"发送速率={(attempts - reported_attempts) / (now - last_report):.1f}/s "
+                      f"累计发送={attempts} 成功={successes} 失败={failures} 在途={len(pending)}",
+                      file=sys.stderr, flush=True)
+                last_report, reported_attempts = now, attempts
+            # 限制在途请求；服务变慢时降速，不堆积无界任务或补发突发流量。
+            if len(pending) >= args.concurrency:
+                time.sleep(0.001)
+                next_send = time.monotonic()
+                continue
+            if now < next_send:
+                time.sleep(min(next_send - now, 0.01))
+                continue
+            event = retries.popleft() if retries else simulator.next_event()
+            if args.dry_run:
+                print(json.dumps(event, ensure_ascii=False), flush=True)
+                successes += 1
+                actions[event["action"]] += 1
+            else:
+                future = executor.submit(send_event, args.endpoint, event, args.timeout)
+                pending[future] = event
+            attempts += 1
+            next_send = max(next_send + interval, now)
     except KeyboardInterrupt:
-        print("\n已停止。", file=sys.stderr)
-    print(f"完成：成功 {successes}，失败尝试 {failures}，行为统计 {dict(actions)}",
+        print("\n停止发送，等待在途请求完成。", file=sys.stderr)
+    finally:
+        executor.shutdown(wait=True)
+        collect_results()
+    print(f"完成：发送 {attempts}，成功 {successes}，失败尝试 {failures}，"
+          f"待重试 {len(retries)}，耗时 {time.monotonic() - started:.2f}s，行为统计 {dict(actions)}",
           file=sys.stderr)
     return 1 if failures else 0
 
