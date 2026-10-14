@@ -263,7 +263,7 @@ async def run_load(args, aiohttp):
     simulator = CommunitySimulator(
         args.users, args.env, args.seed, args.max_active_projects
     )
-    successes = failures = attempts = 0
+    successes = failed_attempts = recovered = attempts = 0
     actions = Counter()
     target_qps = args.qps if args.interval is None else (
         None if args.interval == 0 else 1 / args.interval
@@ -273,6 +273,7 @@ async def run_load(args, aiohttp):
     pending = set()
     completed = asyncio.Queue()
     retries = deque()
+    retrying_log_ids = set()
     loop = asyncio.get_running_loop()
     started = last_report = loop.time()
     reported_attempts = 0
@@ -288,7 +289,7 @@ async def run_load(args, aiohttp):
             return None, str(error)
 
     def collect_results():
-        nonlocal successes, failures
+        nonlocal successes, failed_attempts, recovered
         while True:
             try:
                 task, event = completed.get_nowait()
@@ -299,10 +300,14 @@ async def run_load(args, aiohttp):
             if status == 202:
                 successes += 1
                 actions[event["action"]] += 1
+                if event["log_id"] in retrying_log_ids:
+                    retrying_log_ids.remove(event["log_id"])
+                    recovered += 1
             else:
-                failures += 1
+                failed_attempts += 1
+                retrying_log_ids.add(event["log_id"])
                 retries.append(event)
-                print(f"失败：log_id={event['log_id']} status={status} response={body}",
+                print(f"失败尝试：log_id={event['log_id']} status={status} response={body}",
                       file=sys.stderr, flush=True)
 
     timeout = aiohttp.ClientTimeout(total=args.timeout)
@@ -317,7 +322,9 @@ async def run_load(args, aiohttp):
             now = loop.time()
             if now - last_report >= 1:
                 print(f"发送速率={(attempts - reported_attempts) / (now - last_report):.1f}/s "
-                      f"累计发送={attempts} 成功={successes} 失败={failures} 在途={len(pending)}",
+                      f"累计发送={attempts} 成功={successes} 失败尝试={failed_attempts} "
+                      f"已恢复={recovered} 未恢复={len(retrying_log_ids)} "
+                      f"在途={len(pending)}",
                       file=sys.stderr, flush=True)
                 last_report, reported_attempts = now, attempts
 
@@ -351,10 +358,11 @@ async def run_load(args, aiohttp):
         if pending:
             await asyncio.gather(*pending)
         collect_results()
-    print(f"完成：发送 {attempts}，成功 {successes}，失败尝试 {failures}，"
-          f"待重试 {len(retries)}，耗时 {loop.time() - started:.2f}s，行为统计 {dict(actions)}",
+    print(f"完成：发送 {attempts}，成功 {successes}，失败尝试 {failed_attempts}，"
+          f"已恢复 {recovered}，未恢复 {len(retrying_log_ids)}，"
+          f"耗时 {loop.time() - started:.2f}s，行为统计 {dict(actions)}",
           file=sys.stderr)
-    return 1 if failures else 0
+    return 1 if retrying_log_ids else 0
 
 
 def main():
