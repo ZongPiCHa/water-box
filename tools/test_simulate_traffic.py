@@ -1,9 +1,12 @@
 """验证模拟数据的跨事件业务关联，运行 python3 -m unittest discover -s tools。"""
 
 from collections import Counter
+import sys
+import time
 import unittest
+from unittest.mock import patch
 
-from simulate_traffic import CommunitySimulator
+from simulate_traffic import CommunitySimulator, parse_arguments
 
 
 class CommunitySimulatorTest(unittest.TestCase):
@@ -93,6 +96,21 @@ class CommunitySimulatorTest(unittest.TestCase):
             self.assertEqual((a["system"], a["theme"], a["action"]),
                              (b["system"], b["theme"], b["action"]))
             self.assertEqual(a["env"], "prod")
+
+    def test_timestamp_is_unix_milliseconds(self):
+        simulator = CommunitySimulator(seed=1)
+        first = simulator.next_event()["timestamp"]
+        time.sleep(0.003)
+        second = simulator.next_event()["timestamp"]
+        self.assertGreaterEqual(first, 1_000_000_000_000)
+        self.assertLess(first, 10_000_000_000_000)
+        self.assertGreaterEqual(second - first, 1)
+
+    def test_default_load_is_two_thousand_qps(self):
+        with patch.object(sys, "argv", ["simulate_traffic.py"]):
+            arguments = parse_arguments()
+        self.assertEqual(arguments.qps, 2000)
+        self.assertEqual(arguments.concurrency, 200)
 
 
 if __name__ == "__main__":

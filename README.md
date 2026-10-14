@@ -42,7 +42,7 @@ curl --request POST http://localhost:8080/api/v1/events \
 
 | 字段 | 约定 |
 | --- | --- |
-| `timestamp` | 必填，正整数 Unix 毫秒时间戳，表示动作发生时间 |
+| `timestamp` | 必填，13 位正整数 Unix 毫秒时间戳，使用 `time.time_ns() // 1_000_000` 生成 |
 | `log_id` | 必填，发送方生成的一次埋点唯一 ID，重试沿用同一个值 |
 | `session_id` | 必填，用户会话 ID，同一会话中的多次动作共用 |
 | `span_id` | 必填，本次操作链路 ID |
@@ -95,9 +95,10 @@ export SERVER_SSL_KEY_ALIAS=water-box
 
 ## 模拟埋点
 
-启动升级后的服务后，使用 Python 3 标准库脚本模拟 100 个用户，默认以每秒 100 条的目标速率持续发送，最多 100 个并发请求。使用 `Ctrl+C` 停止发送并等待在途请求完成：
+启动升级后的服务后，使用 Python 3 脚本模拟 100 个用户，默认以每秒 2,000 条的目标速率持续发送，最多 200 个并发请求。使用 `Ctrl+C` 停止发送并等待在途请求完成：
 
 ```bash
+python3 -m pip install --user --break-system-packages -r tools/requirements.txt
 python3 tools/simulate_traffic.py
 ```
 
@@ -105,14 +106,16 @@ python3 tools/simulate_traffic.py
 
 ```bash
 python3 tools/simulate_traffic.py --interval 1
-python3 tools/simulate_traffic.py --count 1000 --qps 100 --seed 42
+python3 tools/simulate_traffic.py --count 10000 --qps 2000 --seed 42
 python3 tools/simulate_traffic.py --endpoint http://服务器IP:8080/api/v1/events
 python3 tools/simulate_traffic.py --dry-run --count 100 --interval 0
 ```
 
+模拟数据生成只使用 Python 标准库；高吞吐 HTTP 发送使用 `aiohttp` 长连接。
 `--users` 默认 100，`--env` 默认 `test`，可设为 `prod`；`--count` 为请求尝试次数，0 表示持续运行。
-`--qps` 默认 100，以请求发起时间限速，不等待上一条响应；`--interval` 与 `--qps` 互斥，兼容低速或不限速发送。
+`--qps` 默认 2,000，以请求发起时间限速，不等待上一条响应；`--interval` 与 `--qps` 互斥，兼容低速或不限速发送。
 每秒输出发送速率、成功数、失败数和在途数。请求耗时过长达到 `--concurrency` 上限时会降速，实际成功写入速率取决于服务和 Kafka 性能。
+2,000 QPS 平均每毫秒产生 2 条事件，因此不同事件可能具有相同 `timestamp`；毫秒时间戳用于表示发生时间，事件唯一性使用 `log_id`，链路关系使用 `span_id`。
 `--dry-run` 仅将 JSON 输出到标准输出，不发送请求；启动信息和汇总输出到标准错误。随机种子固定行为序列，ID 和真实时间戳仍随运行变化。
 
 | 主题/动作 | 上报端 | 模拟行为 |

@@ -2,15 +2,14 @@
 """有状态的社区埋点模拟器，仅依赖 Python 标准库。"""
 
 import argparse
+import asyncio
 from collections import Counter, deque
-from concurrent.futures import ThreadPoolExecutor
 import heapq
 import json
+import math
 import random
 import sys
 import time
-import urllib.error
-import urllib.request
 import uuid
 
 
@@ -49,6 +48,10 @@ class CommunitySimulator:
     def new_id():
         return str(uuid.uuid4())
 
+    @staticmethod
+    def now_ms():
+        return time.time_ns() // 1_000_000
+
     def create_project(self, user):
         self.project_serial += 1
         project_id = f"project-{self.run_id}-{self.project_serial:05d}"
@@ -64,7 +67,7 @@ class CommunitySimulator:
 
     def event(self, user, system, theme, action, properties, parent=None, team_id=None):
         return {
-            "timestamp": int(time.time() * 1000),
+            "timestamp": self.now_ms(),
             "log_id": self.new_id(),
             "session_id": user["session_id"],
             "span_id": self.new_id(),
@@ -95,7 +98,7 @@ class CommunitySimulator:
         self.tick += 1
         if self.pending:
             event = self.pending.popleft()
-            event["timestamp"] = int(time.time() * 1000)
+            event["timestamp"] = self.now_ms()
             return event
 
         if self.undos and self.undos[0][0] <= self.tick:
@@ -206,9 +209,9 @@ def parse_arguments():
     parser.add_argument("--users", type=int, default=100)
     parser.add_argument("--count", type=int, default=0, help="发送条数，0 表示持续运行")
     rate = parser.add_mutually_exclusive_group()
-    rate.add_argument("--qps", type=float, default=100, help="每秒请求尝试次数，默认 100")
+    rate.add_argument("--qps", type=float, default=2000, help="每秒请求尝试次数，默认 2000")
     rate.add_argument("--interval", type=float, help="请求发起间隔秒数，0 表示不限速")
-    parser.add_argument("--concurrency", type=int, default=100, help="最大并发请求数")
+    parser.add_argument("--concurrency", type=int, default=200, help="最大并发请求数")
     parser.add_argument("--timeout", type=float, default=35)
     parser.add_argument("--env", choices=["prod", "test"], default="test")
     parser.add_argument("--seed", type=int, help="固定行为随机种子")
@@ -221,41 +224,41 @@ def parse_arguments():
     return args
 
 
-def send_event(endpoint, event, timeout):
-    request = urllib.request.Request(
-        endpoint, data=json.dumps(event, ensure_ascii=False).encode("utf-8"),
-        headers={"Content-Type": "application/json"}, method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return response.status, response.read().decode("utf-8")
-    except urllib.error.HTTPError as error:
-        return error.code, error.read().decode("utf-8", errors="replace")
-    except (urllib.error.URLError, TimeoutError, OSError) as error:
-        return None, str(error)
-
-
-def main():
-    args = parse_arguments()
+async def run_load(args, aiohttp):
     simulator = CommunitySimulator(args.users, args.env, args.seed)
     successes = failures = attempts = 0
     actions = Counter()
-    interval = args.interval if args.interval is not None else 1 / args.qps
-    pending = {}
+    target_qps = args.qps if args.interval is None else (
+        None if args.interval == 0 else 1 / args.interval
+    )
+    interval = 0 if target_qps is None else 1 / target_qps
+    burst_limit = args.concurrency if target_qps is None else max(1, math.ceil(target_qps * 0.01))
+    pending = set()
+    completed = asyncio.Queue()
     retries = deque()
-    started = next_send = last_report = time.monotonic()
+    loop = asyncio.get_running_loop()
+    started = last_report = loop.time()
     reported_attempts = 0
     print(f"模拟 {args.users} 用户，env={args.env}，"
           f"发送间隔={interval:g}s，并发上限={args.concurrency}，Ctrl+C 停止。",
           file=sys.stderr, flush=True)
 
+    async def send_event(session, event):
+        try:
+            async with session.post(args.endpoint, json=event) as response:
+                return response.status, await response.text()
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as error:
+            return None, str(error)
+
     def collect_results():
         nonlocal successes, failures
-        for future in list(pending):
-            if not future.done():
-                continue
-            event = pending.pop(future)
-            status, body = future.result()
+        while True:
+            try:
+                task, event = completed.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            pending.discard(task)
+            status, body = task.result()
             if status == 202:
                 successes += 1
                 actions[event["action"]] += 1
@@ -265,43 +268,71 @@ def main():
                 print(f"失败：log_id={event['log_id']} status={status} response={body}",
                       file=sys.stderr, flush=True)
 
-    executor = ThreadPoolExecutor(max_workers=args.concurrency)
-    try:
+    timeout = aiohttp.ClientTimeout(total=args.timeout)
+    connector = aiohttp.TCPConnector(
+        limit=args.concurrency,
+        limit_per_host=args.concurrency,
+        keepalive_timeout=30,
+    )
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         while args.count == 0 or attempts < args.count:
             collect_results()
-            now = time.monotonic()
+            now = loop.time()
             if now - last_report >= 1:
                 print(f"发送速率={(attempts - reported_attempts) / (now - last_report):.1f}/s "
                       f"累计发送={attempts} 成功={successes} 失败={failures} 在途={len(pending)}",
                       file=sys.stderr, flush=True)
                 last_report, reported_attempts = now, attempts
-            # 限制在途请求；服务变慢时降速，不堆积无界任务或补发突发流量。
-            if len(pending) >= args.concurrency:
-                time.sleep(0.001)
-                next_send = time.monotonic()
-                continue
-            if now < next_send:
-                time.sleep(min(next_send - now, 0.01))
-                continue
-            event = retries.popleft() if retries else simulator.next_event()
-            if args.dry_run:
-                print(json.dumps(event, ensure_ascii=False), flush=True)
-                successes += 1
-                actions[event["action"]] += 1
+
+            capacity = args.concurrency - len(pending)
+            remaining = capacity if args.count == 0 else min(capacity, args.count - attempts)
+            if target_qps is None:
+                due = remaining
             else:
-                future = executor.submit(send_event, args.endpoint, event, args.timeout)
-                pending[future] = event
-            attempts += 1
-            next_send = max(next_send + interval, now)
-    except KeyboardInterrupt:
-        print("\n停止发送，等待在途请求完成。", file=sys.stderr)
-    finally:
-        executor.shutdown(wait=True)
+                expected = math.floor((now - started) * target_qps) + 1
+                due = min(max(0, expected - attempts), burst_limit, remaining)
+
+            for _ in range(due):
+                event = retries.popleft() if retries else simulator.next_event()
+                event["timestamp"] = simulator.now_ms()
+                if args.dry_run:
+                    print(json.dumps(event, ensure_ascii=False), flush=True)
+                    successes += 1
+                    actions[event["action"]] += 1
+                else:
+                    task = asyncio.create_task(send_event(session, event))
+                    pending.add(task)
+                    task.add_done_callback(
+                        lambda finished, submitted=event:
+                        completed.put_nowait((finished, submitted))
+                    )
+                attempts += 1
+
+            if due == 0:
+                await asyncio.sleep(0.0005)
+
+        if pending:
+            await asyncio.gather(*pending)
         collect_results()
     print(f"完成：发送 {attempts}，成功 {successes}，失败尝试 {failures}，"
-          f"待重试 {len(retries)}，耗时 {time.monotonic() - started:.2f}s，行为统计 {dict(actions)}",
+          f"待重试 {len(retries)}，耗时 {loop.time() - started:.2f}s，行为统计 {dict(actions)}",
           file=sys.stderr)
     return 1 if failures else 0
+
+
+def main():
+    args = parse_arguments()
+    try:
+        import aiohttp
+    except ModuleNotFoundError:
+        print("缺少 aiohttp，请先执行：python3 -m pip install -r tools/requirements.txt",
+              file=sys.stderr)
+        return 2
+    try:
+        return asyncio.run(run_load(args, aiohttp))
+    except KeyboardInterrupt:
+        print("\n已停止。", file=sys.stderr)
+        return 130
 
 
 if __name__ == "__main__":
