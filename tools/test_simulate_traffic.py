@@ -112,6 +112,13 @@ class CommunitySimulatorTest(unittest.TestCase):
         self.assertEqual(arguments.qps, 2000)
         self.assertEqual(arguments.concurrency, 200)
 
+    def test_active_project_feed_is_bounded(self):
+        simulator = CommunitySimulator(seed=7, max_active_projects=100)
+        for _ in range(10000):
+            simulator.next_event()
+        self.assertEqual(len(simulator.projects), 100)
+        self.assertEqual(len(simulator.project_feed), 100)
+
 
 if __name__ == "__main__":
     unittest.main()

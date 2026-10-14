@@ -14,12 +14,15 @@ import uuid
 
 
 class CommunitySimulator:
-    def __init__(self, users=100, env="test", seed=None):
+    def __init__(self, users=100, env="test", seed=None, max_active_projects=10000):
         self.random = random.Random(seed)
         self.env = env
         self.run_id = uuid.uuid4().hex[:8]
         self.users = []
         self.projects = {}
+        self.project_feed = []
+        self.project_feed_cursor = 0
+        self.max_active_projects = max_active_projects
         self.comments = {}
         self.likes = set()
         self.follows = set()
@@ -63,7 +66,35 @@ class CommunitySimulator:
             "popularity": self.random.paretovariate(1.8),
         }
         self.projects[project_id] = project
+        if len(self.project_feed) < self.max_active_projects:
+            self.project_feed.append(project)
+        else:
+            expired = self.project_feed[self.project_feed_cursor]
+            self.projects.pop(expired["project_id"], None)
+            self.project_feed[self.project_feed_cursor] = project
+            self.project_feed_cursor = (
+                self.project_feed_cursor + 1
+            ) % self.max_active_projects
         return project
+
+    def choose_project(self, user):
+        # 从活跃 Feed 的固定小样本中按热度选择，避免作品总量增长后逐条全表扫描。
+        sample_size = min(16, len(self.project_feed))
+        for _ in range(5):
+            candidates = self.random.sample(self.project_feed, sample_size)
+            candidates = [
+                project for project in candidates
+                if project["author_user_id"] != user["user_id"]
+            ]
+            if candidates:
+                return self.random.choices(
+                    candidates,
+                    weights=[project["popularity"] for project in candidates],
+                )[0]
+        return next(
+            project for project in self.project_feed
+            if project["author_user_id"] != user["user_id"]
+        )
 
     def event(self, user, system, theme, action, properties, parent=None, team_id=None):
         return {
@@ -146,8 +177,7 @@ class CommunitySimulator:
                 "title": project["title"],
             }, team_id=project["team_id"])
 
-        candidates = [p for p in self.projects.values() if p["author_user_id"] != user["user_id"]]
-        project = self.random.choices(candidates, weights=[p["popularity"] for p in candidates])[0]
+        project = self.choose_project(user)
         properties = {
             "project_id": project["project_id"],
             "author_user_id": project["author_user_id"],
@@ -207,6 +237,10 @@ def parse_arguments():
     parser = argparse.ArgumentParser(description="模拟 100 用户在类 Figma 社区中的行为")
     parser.add_argument("--endpoint", default="http://127.0.0.1:8080/api/v1/events")
     parser.add_argument("--users", type=int, default=100)
+    parser.add_argument(
+        "--max-active-projects", type=int, default=10000,
+        help="参与后续互动的活跃作品池上限",
+    )
     parser.add_argument("--count", type=int, default=0, help="发送条数，0 表示持续运行")
     rate = parser.add_mutually_exclusive_group()
     rate.add_argument("--qps", type=float, default=2000, help="每秒请求尝试次数，默认 2000")
@@ -217,15 +251,18 @@ def parse_arguments():
     parser.add_argument("--seed", type=int, help="固定行为随机种子")
     parser.add_argument("--dry-run", action="store_true", help="仅打印 JSON，不调用服务")
     args = parser.parse_args()
-    if (args.users < 2 or args.count < 0 or args.qps <= 0
+    if (args.users < 2 or args.max_active_projects < 100 or args.count < 0 or args.qps <= 0
             or (args.interval is not None and args.interval < 0)
             or args.timeout <= 0 or args.concurrency < 1):
-        parser.error("users 至少为 2，count 和 interval 非负，qps、timeout 和 concurrency 为正")
+        parser.error("users 至少为 2，活跃作品池至少为 100，count 和 interval 非负，"
+                     "qps、timeout 和 concurrency 为正")
     return args
 
 
 async def run_load(args, aiohttp):
-    simulator = CommunitySimulator(args.users, args.env, args.seed)
+    simulator = CommunitySimulator(
+        args.users, args.env, args.seed, args.max_active_projects
+    )
     successes = failures = attempts = 0
     actions = Counter()
     target_qps = args.qps if args.interval is None else (
