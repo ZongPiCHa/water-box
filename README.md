@@ -102,50 +102,42 @@ python3 -m pip install --user --break-system-packages -r tools/requirements.txt
 python3 tools/simulate_traffic.py
 ```
 
-可修改发送间隔，或通过 `--count` 指定发送次数：
+模拟器启动时从 water_community 的 `GET /api/simulation/catalog` 读取真实的用户、作品、已有点赞和关注关系，因此需要先启动 water_community（默认 `http://127.0.0.1:8090`）：
 
 ```bash
 python3 tools/simulate_traffic.py --interval 1
 python3 tools/simulate_traffic.py --count 10000 --qps 2000 --seed 42
-python3 tools/simulate_traffic.py --endpoint http://服务器IP:8080/api/v1/events
+python3 tools/simulate_traffic.py --community-url http://服务器IP:8090 --endpoint http://服务器IP:8080/api/v1/events
 python3 tools/simulate_traffic.py --dry-run --count 100 --interval 0
 ```
 
 模拟数据生成只使用 Python 标准库；高吞吐 HTTP 发送使用 `aiohttp` 长连接。
-`--users` 默认 100，`--env` 默认 `test`，可设为 `prod`；`--count` 为请求尝试次数，0 表示持续运行。
+`--env` 默认 `test`，可设为 `prod`；`--count` 为请求尝试次数，0 表示持续运行。
 `--qps` 默认 2,000，以请求发起时间限速，不等待上一条响应；`--interval` 与 `--qps` 互斥，兼容低速或不限速发送。
-`--max-active-projects` 默认 10,000，只限制参与后续随机互动的作品池，防止长期运行时内存和抽样开销随作品总量无限增长。
 每秒输出发送速率、成功数、失败尝试、已恢复、未恢复和在途数。失败尝试是历史累计值，不代表永久丢失；失败消息会沿用原 `log_id` 重试，后续成功后计入已恢复。请求耗时过长达到 `--concurrency` 上限时会降速，实际成功写入速率取决于服务和 Kafka 性能。
 2,000 QPS 平均每毫秒产生 2 条事件，因此不同事件可能具有相同 `timestamp`；毫秒时间戳用于表示发生时间，事件唯一性使用 `log_id`，链路关系使用 `span_id`。
-`--dry-run` 仅将 JSON 输出到标准输出，不发送请求；启动信息和汇总输出到标准错误。随机种子固定行为序列，ID 和真实时间戳仍随运行变化。
+`--dry-run` 仅将 JSON 输出到标准输出，不发送请求；启动信息和汇总输出到标准错误。随机种子固定行为序列，日志和链路 ID 仍随运行变化。
 
-| 主题/动作 | 上报端 | 模拟行为 |
-| --- | --- | --- |
-| `community/view` | `front` | 浏览作品，包含停留时长、来源页面 |
-| `community/like`、`community/unlike` | `backend` | 点赞；约 10% 的点赞延迟取消 |
-| `community/comment`、`community/delete_comment` | `backend` | 评论；约 10% 的评论由原作者延迟删除 |
-| `community/share` | `front` | 前端生成转发链接，不生成后端转发事件 |
-| `community/follow` | `backend` | 关注作品作者，同一用户不重复关注同一作者 |
-| `community/publish` | `backend` | 发布个人或团队作品，团队作品带顶层 `team_id` |
-| `login_page/view`、`login_page/login` | `front`、`backend` | 少量登录页浏览及登录成功事件 |
-| `profile/update_username`、`team/join` | `backend` | 少量改名、加入团队，`user_id` 保持不变 |
+| action | 上报端 | properties | 模拟行为 |
+| --- | --- | --- | --- |
+| `view_page` | `front` | `project_id`、`author_user_id` | 浏览作品，每次互动前都会先产生 |
+| `like` / `unlike` | `backend` | `project_id`、`author_user_id` | 点赞；10% 的点赞延迟取消 |
+| `comment` / `delete_comment` | `backend` | `project_id`、`author_user_id`、`comment_id` | 评论；10% 的评论由评论者延迟删除 |
+| `share` | `backend` | `project_id`、`author_user_id` | 转发作品 |
+| `follow` | `backend` | `project_id`、`target_user_id` | 在作品下关注作者，同一用户不重复关注同一作者 |
 
-模拟器初始化约 50 个历史作品，不发送它们的发布事件；新作品会先产生发布事件再参与互动。
-作品使用 `project_id`，评论使用 `comment_id`，关注目标使用 `target_user_id`，这些业务字段都放在 `properties`。
-作品热度和用户活跃度有差异，同一用户不能重复点赞同一作品，也不能关注自己。
-互动先生成关联浏览，通过 `pre_span_id` 连接上游 `span_id`；用户登录或闲置 30 分钟后更换会话。
-取消和删除会延迟 5～30 个生成步骤，因此短样本或运行末尾尚未执行的操作会让实际比例偏离 10%。不生成删除作品事件。
+所有事件 `theme=community`、`team_id=null`，`properties` 的值都是非空字符串。
+用户、作品和作者关系来自 water_community（扩容后 10,000 用户、20,000 作品），ID 均为 16 位字符串；新评论 ID 按同样规则生成（`c` + 15 位 base36）。
+已存在的点赞和关注会被跳过，同一用户不会重复点赞同一作品，也不会给自己的作品点赞或关注自己。
+互动通过 `pre_span_id` 连接对应 `view_page` 的 `span_id`；用户闲置 30 分钟后更换会话。
+取消和删除会延迟 5～30 个生成步骤，因此短样本或运行末尾尚未执行的操作会让实际比例偏离 10%。
 
-脚本仅模拟埋点，不调用真实社区业务 API。内存状态在脚本退出后重置，各次运行 ID 不重叠。
+脚本仅模拟埋点，不调用 water_community 的写接口，社区数据库不会因模拟而变化；内存状态在脚本退出后重置。
 同一台机器只应运行一个模拟器实例，可用 `pgrep -af simulate_traffic.py` 检查。
 脚本在服务返回 `202` 时视为 Kafka 已确认写入；失败消息沿用原 `log_id` 优先重试，重试也计入限速和 `--count`。并发发送时，关联事件的接收顺序可能与生成顺序不同；消费端应使用时间戳与链路字段关联。
 服务端为每个收到的合法事件输出一条 `INFO` 日志，Kafka 异步发送失败输出 `ERROR`，不会记录完整 `properties`。
 埋点日志只写入 `logs/events.log`，避免高频控制台输出阻塞 HTTP 请求线程；每天或每 100MB 滚动，保留 7 天，总量上限 1GB。
 可通过 `--water-box.logging.path=/指定目录` 修改日志目录。
-
-```bash
-tail -f logs/events.log
-```
 
 ## 吞吐配置
 
