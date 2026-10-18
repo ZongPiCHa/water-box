@@ -93,9 +93,9 @@ export SERVER_SSL_KEY_ALIAS=water-box
 ./mvnw spring-boot:run
 ```
 
-## 模拟埋点
+## 真实社区行为模拟
 
-启动升级后的服务后，使用 Python 3 脚本模拟 100 个用户，默认以每秒 2,000 条的目标速率持续发送，最多 200 个并发请求。使用 `Ctrl+C` 停止发送并等待在途请求完成：
+脚本调用线上 water_community 业务接口，互动会修改真实数据库，由社区后端生成埋点。默认每秒模拟 100 个行为，其中 50% 是不发请求的浏览，因此业务请求约 50 次/秒；最多 10 个在途请求。`Ctrl+C` 停止发起新行为并等待在途请求完成。
 
 ```bash
 python3 -m pip install --user --break-system-packages -r tools/requirements.txt
@@ -106,35 +106,34 @@ python3 tools/simulate_traffic.py
 
 ```bash
 python3 tools/simulate_traffic.py --interval 1
-python3 tools/simulate_traffic.py --count 10000 --qps 2000 --seed 42
-python3 tools/simulate_traffic.py --community-url http://服务器IP:8090 --endpoint http://服务器IP:8080/api/v1/events
+python3 tools/simulate_traffic.py --count 10000 --qps 100 --seed 42
+python3 tools/simulate_traffic.py --community-url http://服务器IP:8090
 python3 tools/simulate_traffic.py --dry-run --count 100 --interval 0
 ```
 
-模拟数据生成只使用 Python 标准库；高吞吐 HTTP 发送使用 `aiohttp` 长连接。
-`--env` 默认 `test`，可设为 `prod`；`--count` 为请求尝试次数，0 表示持续运行。
-`--qps` 默认 2,000，以请求发起时间限速，不等待上一条响应；`--interval` 与 `--qps` 互斥，兼容低速或不限速发送。
-每秒输出发送速率、成功数、失败尝试、已恢复、未恢复和在途数。失败尝试是历史累计值，不代表永久丢失；失败消息会沿用原 `log_id` 重试，后续成功后计入已恢复。请求耗时过长达到 `--concurrency` 上限时会降速，实际成功写入速率取决于服务和 Kafka 性能。
-2,000 QPS 平均每毫秒产生 2 条事件，因此不同事件可能具有相同 `timestamp`；毫秒时间戳用于表示发生时间，事件唯一性使用 `log_id`，链路关系使用 `span_id`。
-`--dry-run` 仅将 JSON 输出到标准输出，不发送请求；启动信息和汇总输出到标准错误。随机种子固定行为序列，日志和链路 ID 仍随运行变化。
+`--count` 为行为总数，包含浏览及取消操作，0 表示持续运行。偶数个行为中浏览严格占 50%，奇数时多一次浏览。浏览只生成本地上下文和统计，既不调用 `/views`，也不向 water-box 发送 `view_page`。
+`--qps` 是包含浏览的行为速率，默认 100；`--interval` 与其互斥。达到并发上限时会降速，恢复后不会突发补发积压请求。
+每秒输出行为数、浏览数、HTTP 请求数、确认成功数、未确认成功数和在途数；结束时输出各行为及待执行取消数量。
+`--dry-run` 仍读取一次真实目录，但只打印后续请求计划，不调用写接口，也不会虚构成功结果或评论 ID，因此不安排取消操作。
+旧 `--endpoint`、`--env` 已移除：埋点入口和环境由 water_community 的 `WATER_BOX_ENDPOINT`、`WATER_BOX_ENV` 配置。脚本不会重复直发后端埋点。
 
-| action | 上报端 | properties | 模拟行为 |
-| --- | --- | --- | --- |
-| `view_page` | `front` | `project_id`、`author_user_id` | 浏览作品，每次互动前都会先产生 |
-| `like` / `unlike` | `backend` | `project_id`、`author_user_id` | 点赞；10% 的点赞延迟取消 |
-| `comment` / `delete_comment` | `backend` | `project_id`、`author_user_id`、`comment_id` | 评论；10% 的评论由评论者延迟删除 |
-| `share` | `backend` | `project_id`、`author_user_id` | 转发作品 |
-| `follow` | `backend` | `project_id`、`target_user_id` | 在作品下关注作者，同一用户不重复关注同一作者 |
+| 行为 | 实际请求 | 成功判断 |
+| --- | --- | --- |
+| `view_page` | 无，仅本地浏览 | 不计入 HTTP 成功数 |
+| `like` / `unlike` | `POST /api/projects/{id}/likes` | HTTP 200，`active` 分别为 true / false |
+| `comment` | `POST /api/projects/{id}/comments`，JSON `{"content":"…"}` | HTTP 201，返回非空评论 ID |
+| `delete_comment` | `DELETE /api/projects/{id}/comments/{comment_id}` | HTTP 204 |
+| `share` | `POST /api/projects/{id}/shares` | HTTP 201，`active=true` |
+| `follow` | `POST /api/users/{authorId}/follow?projectId={id}` | HTTP 200，`active=true` |
 
-所有事件 `theme=community`、`team_id=null`，`properties` 的值都是非空字符串。
-用户、作品和作者关系来自 water_community（扩容后 10,000 用户、20,000 作品），ID 均为 16 位字符串；新评论 ID 按同样规则生成（`c` + 15 位 base36）。
-已存在的点赞和关注会被跳过，同一用户不会重复点赞同一作品，也不会给自己的作品点赞或关注自己。
-互动通过 `pre_span_id` 连接对应 `view_page` 的 `span_id`；用户闲置 30 分钟后更换会话。
-取消和删除会延迟 5～30 个生成步骤，因此短样本或运行末尾尚未执行的操作会让实际比例偏离 10%。
+请求携带 `X-User-Id`、`X-Session-Id` 和可用的 `X-Span-Id`；用户闲置 30 分钟后轮换会话。浏览链路只保存在本地，因此可能出现没有对应已上报浏览事件的 `pre_span_id`。
+用户、作品、作者、已有点赞和关注来自真实目录。后端成功响应后才更新本地关系，新增评论 ID 必须采用后端返回值。只有本轮确认成功的点赞和评论会按 10% 概率安排取消，延迟 5～30 个行为步骤，并沿用原操作用户。
+已有点赞、关注以及同一关系的在途请求会被跳过；不会主动点赞自己的作品或关注自己。统计成功代表业务成功，不代表 Kafka 投递已确认，后者查看社区后端与 water-box 日志。
 
-脚本仅模拟埋点，不调用 water_community 的写接口，社区数据库不会因模拟而变化；内存状态在脚本退出后重置。
-同一台机器只应运行一个模拟器实例，可用 `pgrep -af simulate_traffic.py` 检查。
-脚本在服务返回 `202` 时视为 Kafka 已确认写入；失败消息沿用原 `log_id` 优先重试，重试也计入限速和 `--count`。并发发送时，关联事件的接收顺序可能与生成顺序不同；消费端应使用时间戳与链路字段关联。
+现有点赞、关注接口是状态切换接口；超时可能已经写入，自动重试可能反向取消。因此写请求失败或响应状态不符时不重试，同一点赞/关注关系在本轮不再操作。评论、转发和删除失败也不重试，以免重复创建。
+同一社区只运行一个模拟器；多个实例或其他客户端并发修改相同关系仍可能导致目录状态过时，遇到状态不符会记录为未确认成功。可用 `pgrep -af simulate_traffic.py` 检查。
+停止时尚未到期的取消不会强行补发，短样本实际取消比例可能偏离 10%；停止再启动会重新读取目录，不恢复上轮待执行取消。
+
 服务端为每个收到的合法事件输出一条 `INFO` 日志，Kafka 异步发送失败输出 `ERROR`，不会记录完整 `properties`。
 埋点日志只写入 `logs/events.log`，避免高频控制台输出阻塞 HTTP 请求线程；每天或每 100MB 滚动，保留 7 天，总量上限 1GB。
 可通过 `--water-box.logging.path=/指定目录` 修改日志目录。
